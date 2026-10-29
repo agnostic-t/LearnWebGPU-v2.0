@@ -1,2 +1,4 @@
 .cache
 .dev
+__cmake_systeminformation
+libs

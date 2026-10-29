@@ -1,187 +1,216 @@
-# Глава 01 — Проект, Dawn, GLFW и CMake
+# Глава 01 — Из чего вообще состоит нативное WebGPU-приложение
 
-> Проверено: 29 октября 2026
->
+> Проверено: 29 октября 2026  
 > **Dawn:** `40d98d8812bb3211592bb78cac8bd7b13b585e19`  
 > **GLFW:** 3.6.0  
 > **GCC:** 14.2.0  
 > **CMake:** 3.31.6  
-> **Ninja:** 1.12.1  
 > **C++:** C++20  
-> **Платформа проверки:** Linux amd64, GLFW X11  
-> **Основной стиль API:** WebGPU C API из `webgpu.h`
+> **Платформа проверки:** Linux amd64, GLFW/X11  
+> **Основной стиль:** WebGPU C API в C++ коде
 
-В этой главе мы не будем ничего рисовать и пока не будем разбирать adapter, device, surface или render pipeline. Цель намного прозаичнее, но для Dawn она критически важна: получить **воспроизводимый C++ проект**, который действительно компилируется, линкуется с GLFW и Dawn и запускается.
+В первой главе мы ещё ничего не нарисуем. Это намеренно.
 
-К концу главы программа:
+Перед тем как создавать треугольник, полезно понять, **кто именно будет его рисовать** и зачем в одном небольшом проекте внезапно нужны сразу WebGPU, Dawn и GLFW.
 
-- инициализирует GLFW;
-- выводит версию GLFW;
-- создаёт `WGPUInstance` через C API;
-- корректно освобождает ресурсы;
-- собирается в Debug и Release.
-
-Создание `WGPUInstance` здесь используется только как smoke-test линковки. Сам `Instance`, его настройки и современную Future/callback модель Dawn подробно разберём в следующей главе.
+К концу главы у нас будет минимальный проект, который действительно линкуется с Dawn и GLFW и создаёт первый объект WebGPU — `WGPUInstance`. Но важнее другое: станет понятна общая архитектура, на которую дальше будут нанизываться adapter, device, surface, pipeline и все остальные части WebGPU.
 
 ---
 
-## 1. Что именно мы собираем
+## 1. Мы хотим рисовать на GPU. Почему нельзя просто обратиться к GPU?
 
-WebGPU — это API. На нативной платформе нам нужна реализация этого API.
+Если сильно упростить, наша программа работает на CPU, а изображение должен построить GPU.
 
-В этой серии такой реализацией будет **Dawn**.
-
-Упрощённо наша программа будет устроена так:
+Можно было бы представить желаемый код так:
 
 ```text
-C++ application
+CPU program
     │
-    ├── GLFW
-    │     └── окно, клавиатура, мышь
-    │
-    └── WebGPU C API
-          │
-          └── Dawn
-                └── Vulkan / Metal / D3D12 / OpenGL / ...
+    └── draw triangle
+            │
+            ▼
+           GPU
 ```
 
-GLFW не рисует WebGPU-графику. Он будет отвечать за окно и ввод.
+Но реальная система устроена сложнее.
 
-Dawn не заменяет GLFW. Он реализует WebGPU и позже создаст GPU device, surface, buffers, pipelines и остальные графические объекты.
+У разных операционных систем и видеодрайверов разные графические API:
 
-На Linux Dawn может работать поверх разных backend'ов. Какой backend и какой физический adapter будет выбран, нас пока не интересует — до этого дойдём в главе 03.
+```text
+Windows  -> Direct3D 12
+Linux    -> Vulkan / OpenGL
+macOS    -> Metal
+```
+
+Если приложение напрямую работает с ними, то значительная часть графического кода становится платформозависимой.
+
+WebGPU вводит ещё один слой:
+
+```text
+наше приложение
+      │
+      │ WebGPU
+      ▼
+ реализация WebGPU
+      │
+      ├── Vulkan
+      ├── Metal
+      ├── D3D12
+      └── ...
+             │
+             ▼
+            GPU
+```
+
+Мы пишем код в терминах WebGPU: buffer, texture, render pipeline, command encoder. А реализация WebGPU решает, какими средствами конкретной платформы это выполнить.
+
+В браузере эту реализацию предоставляет браузер. В нашем нативном C++ приложении ею будет **Dawn**.
 
 ---
 
-## 2. Почему код на C++, а WebGPU API — C
+## 2. Тогда что такое Dawn?
 
-Проект компилируется как C++20, но основной WebGPU-код серии будет написан через C API.
+Dawn — это реализация WebGPU, разрабатываемая в экосистеме Chromium.
 
-Например:
+Для нас это означает следующее:
+
+```cpp
+WGPUInstance instance = wgpuCreateInstance(...);
+```
+
+Функция объявлена WebGPU C API, но её реальный код находится в библиотеке Dawn:
+
+```text
+libwebgpu_dawn.a
+```
+
+То есть важно различать два понятия:
+
+```text
+WebGPU = интерфейс и модель API
+Dawn   = конкретная реализация этого API
+```
+
+Это похоже на ситуацию со стандартной библиотекой C++: язык описывает интерфейс и правила, а конкретный toolchain предоставляет реализацию.
+
+В дальнейшем мы будем говорить «WebGPU», когда обсуждаем сам API, и «Dawn», когда речь идёт о конкретной реализации, её сборке, backend'ах или особенностях текущей версии.
+
+---
+
+## 3. А зачем тогда GLFW?
+
+WebGPU умеет рисовать, но наше приложение всё ещё должно получить обычное окно операционной системы.
+
+Создание окна само по себе сильно отличается между платформами:
+
+```text
+Windows -> Win32
+Linux   -> X11 или Wayland
+macOS   -> Cocoa
+```
+
+Нам не хочется одновременно учить WebGPU и писать три разных оконных backend'а. Поэтому эту задачу отдаём GLFW.
+
+В будущем разделение обязанностей будет таким:
+
+```text
+                     наше приложение
+                    /              \
+                   /                \
+                  ▼                  ▼
+               GLFW                WebGPU
+          окно / ввод              рендеринг
+                  \                  /
+                   \                /
+                    ▼              ▼
+                   операционная система
+                          │
+                          ▼
+                         GPU
+```
+
+GLFW будет отвечать за:
+
+- создание окна;
+- события окна;
+- клавиатуру;
+- мышь;
+- позже — захват курсора для FPS-камеры.
+
+Dawn/WebGPU будет отвечать за:
+
+- выбор графического adapter;
+- создание device;
+- работу с GPU-ресурсами;
+- shaders;
+- render pipeline;
+- отправку команд GPU.
+
+Позже официальный Dawn helper соединит эти два мира:
+
+```cpp
+wgpuGlfwCreateSurfaceForWindow(instance, window);
+```
+
+Но до surface мы ещё дойдём отдельно.
+
+---
+
+## 4. Почему проект написан на C++, а API используем C
+
+Dawn предоставляет две удобные формы API.
+
+C API:
 
 ```cpp
 WGPUInstance instance = wgpuCreateInstance(&descriptor);
 ```
 
-а не:
+C++ wrapper:
 
 ```cpp
 wgpu::Instance instance = wgpu::CreateInstance(&descriptor);
 ```
 
-Это сознательное решение.
+В этом туториале основной код будет на C++, но WebGPU мы будем изучать через **C API**.
 
-C API делает механику WebGPU более явной:
+Причина не в том, что C API «лучше». Для обучения он просто делает происходящее более явным.
 
-- видно реальные handle-типы `WGPUDevice`, `WGPUBuffer`, `WGPUSurface`;
-- видно, какие функции создают объекты;
-- видно, где объект нужно release'ить;
-- проще сопоставлять код со спецификацией и заголовком `webgpu.h`;
-- меньше логики скрыто за C++ wrapper'ом.
+Например, в C API сразу видно:
 
-При этом сам язык C++ нам всё равно полезен: позже мы сможем использовать классы приложения, `std::vector`, `std::array`, RAII-обёртки, математику камеры и другие возможности языка.
+```cpp
+WGPUInstance instance = ...;
+wgpuInstanceRelease(instance);
+```
 
-В конце важных разделов будет блок **«Как это выглядит через C++ wrapper»**.
+То есть у нас есть handle, и мы явно управляем его lifetime.
+
+C++ wrapper позже сможет скрыть часть этой работы за RAII. Это удобно в приложении, но на первых этапах полезно видеть, какие операции реально происходят.
+
+Поэтому правило серии такое:
+
+> Сначала разбираем механизм через C API. Рядом показываем, как тот же код выглядит через C++ wrapper.
+
+При этом всё остальное приложение остаётся обычным современным C++20.
 
 ---
 
-# 3. Какие заголовки Dawn нам нужны
+## 5. Что нам дали собранные зависимости
 
-После установки Dawn в каталоге `include/webgpu` находятся несколько важных файлов.
-
-Для начала нас интересуют три:
-
-```text
-webgpu/
-├── webgpu.h
-├── webgpu_cpp.h
-└── webgpu_glfw.h
-```
-
-## `webgpu.h`
-
-Основной заголовок серии.
-
-```cpp
-#include <webgpu/webgpu.h>
-```
-
-Он содержит C API:
-
-```cpp
-WGPUInstance
-WGPUDevice
-WGPUBuffer
-WGPURenderPipeline
-```
-
-и функции вида:
-
-```cpp
-wgpuCreateInstance(...)
-wgpuDeviceCreateBuffer(...)
-wgpuQueueSubmit(...)
-```
-
----
-
-## `webgpu_cpp.h`
-
-C++ wrapper поверх того же API:
-
-```cpp
-#include <webgpu/webgpu_cpp.h>
-```
-
-Он предоставляет типы:
-
-```cpp
-wgpu::Instance
-wgpu::Device
-wgpu::Buffer
-```
-
-В основной версии проекта мы его пока не подключаем.
-
----
-
-## `webgpu_glfw.h`
-
-Официальный Dawn helper для интеграции GLFW с WebGPU surface:
-
-```cpp
-#include <webgpu/webgpu_glfw.h>
-```
-
-Позже он позволит написать:
-
-```cpp
-WGPUSurface surface =
-    wgpuGlfwCreateSurfaceForWindow(instance, window);
-```
-
-Вместо самостоятельного написания отдельного кода для X11, Wayland, Win32 и Metal.
-
-В этой главе `webgpu_glfw.h` ещё не нужен. Он появится в главе про Surface.
-
----
-
-# 4. Статические библиотеки
-
-Для текущей конфигурации зависимости выглядят так:
+В проекте зависимости лежат локально:
 
 ```text
 .modules/
 ├── dawn/
+│   ├── DAWN_COMMIT
 │   ├── include/
 │   │   └── webgpu/
 │   │       ├── webgpu.h
 │   │       ├── webgpu_cpp.h
 │   │       └── webgpu_glfw.h
-│   ├── lib/
-│   │   ├── libwebgpu_dawn.a
-│   │   └── libdawn_glfw.a
-│   └── DAWN_COMMIT
+│   └── lib/
+│       ├── libwebgpu_dawn.a
+│       └── libdawn_glfw.a
 │
 └── glfw3/
     ├── include/
@@ -192,92 +221,99 @@ WGPUSurface surface =
         └── libglfw3.a
 ```
 
-Главная библиотека Dawn:
+Пока нас интересуют только две библиотеки:
 
 ```text
+libglfw3.a
 libwebgpu_dawn.a
 ```
 
-Именно в ней находится реализация WebGPU API, которую мы вызываем из `webgpu.h`.
+`libdawn_glfw.a` понадобится, когда мы начнём создавать WebGPU surface из GLFW window.
 
-`libdawn_glfw.a` понадобится позже, когда начнём использовать `wgpuGlfwCreateSurfaceForWindow()`.
+Из заголовков первым понадобится:
 
-Сейчас она нам не нужна.
+```cpp
+#include <webgpu/webgpu.h>
+```
+
+Именно здесь находится C API с типами вида:
+
+```cpp
+WGPUInstance
+WGPUAdapter
+WGPUDevice
+WGPUBuffer
+```
+
+и функциями вида:
+
+```cpp
+wgpuCreateInstance(...)
+wgpuInstanceRequestAdapter(...)
+wgpuDeviceCreateBuffer(...)
+```
+
+Пока последние две функции нам не нужны. Сейчас важно только проверить, что первый настоящий вызов Dawn вообще работает.
 
 ---
 
-# 5. Почему важно фиксировать версию Dawn
+## 6. Почему мы фиксируем commit Dawn
 
-Dawn развивается быстро.
+Dawn обновляется постоянно. Для обычного приложения это хорошо, но для туториала создаёт проблему.
 
-Если сегодня выполнить:
+Если написать:
 
 ```bash
 git clone --depth 1 https://dawn.googlesource.com/dawn
 ```
 
-а через несколько месяцев повторить ту же команду, это уже может быть заметно другой API.
+сегодня и повторить ту же команду через несколько месяцев, можно получить API с другими структурами, enum'ами или callback signatures.
 
-Поэтому фраза:
-
-> «пример написан для последнего Dawn»
-
-для учебного материала недостаточно точна.
-
-В этой версии туториала используется commit:
+Поэтому этот туториал привязан не к фразе «последний Dawn», а к конкретному commit:
 
 ```text
 40d98d8812bb3211592bb78cac8bd7b13b585e19
 ```
 
-Хорошая практика после сборки Dawn сохранить его commit рядом с установленными библиотеками:
+Он сохранён в:
 
-```bash
-git -C "$SOURCE_DIR" rev-parse HEAD \
-    > "$INSTALL_DIR/DAWN_COMMIT"
+```text
+.modules/dawn/DAWN_COMMIT
 ```
 
-Тогда версию можно проверить обычной командой:
+Проверить его можно так:
 
 ```bash
 cat .modules/dawn/DAWN_COMMIT
 ```
 
-Для учебного проекта это намного надёжнее, чем пытаться помнить дату, когда зависимости были собраны.
+Когда Dawn будет обновляться, правильно обновлять его осознанно: выбрать новый commit, пересобрать зависимости и прогнать все примеры заново.
 
 ---
 
-# 6. Структура проекта
+## 7. Создаём каркас проекта
 
-Начнём с минимальной структуры:
+Начинаем с очень маленькой структуры:
 
 ```text
 webgpu-tutorial/
 ├── .modules/
 │   ├── dawn/
 │   └── glfw3/
-│
 ├── src/
 │   └── main.cpp
-│
 └── CMakeLists.txt
 ```
 
-Позже проект разрастётся. Появятся файлы для приложения, камеры, geometry и WebGPU-ресурсов.
+Смысл такого старта простой: пока мы ещё не знаем, какие абстракции действительно понадобятся приложению, нет причин заранее создавать `Renderer`, `Application`, `Context`, `DeviceManager` и десяток других классов.
 
-Но пока этого достаточно.
-
-Создадим каталог исходников:
-
-```bash
-mkdir -p src
-```
+Мы сначала увидим WebGPU в работе, а структуру программы будем усложнять тогда, когда для этого появится реальная причина.
 
 ---
 
-# 7. Первый `CMakeLists.txt`
+## 8. CMake: подключаем уже собранные библиотеки
 
-Создадим в корне проекта файл `CMakeLists.txt`:
+Создадим `CMakeLists.txt`:
 
 ```cmake
 cmake_minimum_required(VERSION 3.25)
@@ -329,205 +365,41 @@ if(UNIX AND NOT APPLE)
 endif()
 ```
 
-Разберём этот файл по частям.
+Здесь много строк, но идея небольшая.
 
----
-
-## 7.1. C++20
-
-```cmake
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-```
-
-Проект явно требует C++20.
-
-`CMAKE_CXX_STANDARD_REQUIRED ON` запрещает CMake молча откатиться на более старый стандарт.
-
-`CMAKE_CXX_EXTENSIONS OFF` просит использовать стандартный C++20, а не GNU-вариант вроде `gnu++20`.
-
-Для GCC итоговый параметр выглядит примерно так:
+Dawn и GLFW уже собраны. Поэтому CMake не должен компилировать их заново — ему нужно только знать:
 
 ```text
--std=c++20
+где лежат headers?
+где лежит .a?
 ```
 
----
-
-## 7.2. Threads
-
-```cmake
-find_package(Threads REQUIRED)
-```
-
-Dawn и GLFW могут использовать системные threading primitives.
-
-Вместо ручного добавления `-pthread` лучше дать CMake выбрать корректный способ через:
-
-```cmake
-Threads::Threads
-```
-
----
-
-## 7.3. Пути к локальным зависимостям
-
-```cmake
-set(GLFW_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.modules/glfw3")
-set(DAWN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.modules/dawn")
-```
-
-Мы намеренно храним зависимости рядом с проектом.
-
-Это делает build более воспроизводимым: проект не зависит от случайно установленной системной версии GLFW или Dawn.
-
----
-
-# 8. Imported target для GLFW
-
-```cmake
-add_library(third_party_glfw STATIC IMPORTED GLOBAL)
-```
-
-Эта команда говорит CMake:
-
-> библиотека уже собрана; собирать её не нужно, но её можно использовать как target.
-
-Указываем местоположение `.a` файла:
-
-```cmake
-IMPORTED_LOCATION "${GLFW_ROOT}/lib/libglfw3.a"
-```
-
-и include directory:
-
-```cmake
-INTERFACE_INCLUDE_DIRECTORIES "${GLFW_ROOT}/include"
-```
-
-Теперь любой target, который линкуется с `third_party_glfw`, автоматически получает путь к GLFW headers.
-
-Для более удобного имени создаём alias:
-
-```cmake
-add_library(third_party::glfw ALIAS third_party_glfw)
-```
-
-После этого приложение может писать:
-
-```cmake
-target_link_libraries(webgpu_tutorial PRIVATE
-    third_party::glfw
-)
-```
-
----
-
-# 9. Imported target для Dawn
-
-Точно так же подключаем основную библиотеку Dawn:
+Именно это описывает imported target:
 
 ```cmake
 add_library(third_party_webgpu_dawn STATIC IMPORTED GLOBAL)
-set_target_properties(third_party_webgpu_dawn PROPERTIES
-    IMPORTED_LOCATION "${DAWN_ROOT}/lib/libwebgpu_dawn.a"
-    INTERFACE_INCLUDE_DIRECTORIES "${DAWN_ROOT}/include"
-)
 ```
 
-И создаём alias:
+а затем:
 
 ```cmake
-add_library(third_party::webgpu_dawn ALIAS third_party_webgpu_dawn)
+IMPORTED_LOCATION ".../libwebgpu_dawn.a"
+INTERFACE_INCLUDE_DIRECTORIES ".../include"
 ```
 
-Теперь include:
+После этого наш executable может зависеть не от набора случайных путей, а от понятной CMake-сущности:
 
-```cpp
-#include <webgpu/webgpu.h>
+```cmake
+third_party::webgpu_dawn
 ```
 
-находится через `DAWN_ROOT/include`, а linker получает:
-
-```text
-libwebgpu_dawn.a
-```
+Для текущего prebuilt bundle это также удобнее, чем полностью полагаться на экспортированные `find_package()` targets: системные зависимости статической библиотеки должны разрешаться уже на той машине, где собирается сам tutorial.
 
 ---
 
-# 10. Почему здесь не используется `find_package(Dawn)`
+## 9. Первый `main.cpp`: пока без окна и без GPU
 
-У установленного Dawn есть CMake package files, поэтому технически можно встретить такой вариант:
-
-```cmake
-find_package(Dawn CONFIG REQUIRED)
-
-target_link_libraries(app PRIVATE
-    dawn::webgpu_dawn
-)
-```
-
-А у GLFW:
-
-```cmake
-find_package(glfw3 CONFIG REQUIRED)
-```
-
-Если Dawn и GLFW собираются и используются **на одной машине**, это удобный вариант.
-
-Но в этой серии мы хотим также уметь переносить уже собранный static bundle `.modules` между совместимыми Linux amd64 системами.
-
-Экспортированные CMake targets статических библиотек могут содержать абсолютные пути к системным библиотекам машины, на которой выполнялась установка. Например:
-
-```text
-/usr/lib/librt.a
-/usr/lib/libm.so
-```
-
-На другой Linux-системе те же библиотеки могут находиться, например, в multiarch-каталоге:
-
-```text
-/usr/lib/x86_64-linux-gnu/
-```
-
-Сама `libwebgpu_dawn.a` при этом может быть полностью рабочей, но импортированный CMake target перестанет быть переносимым.
-
-Поэтому для prebuilt bundle в учебном проекте мы создаём собственные imported targets и просим **локальный CMake** найти системные зависимости.
-
-Это не ограничение WebGPU и не требование Dawn. Это выбор структуры нашего проекта.
-
----
-
-# 11. Linux system libraries
-
-Для текущей статической сборки на Linux добавляем:
-
-```cmake
-if(UNIX AND NOT APPLE)
-    target_link_libraries(webgpu_tutorial PRIVATE
-        ${CMAKE_DL_LIBS}
-        m
-        rt
-    )
-endif()
-```
-
-Здесь:
-
-- `${CMAKE_DL_LIBS}` — библиотека dynamic loader, обычно `dl`;
-- `m` — стандартная math library;
-- `rt` — POSIX realtime library там, где она нужна.
-
-Этот блок относится к текущей Linux-конфигурации проекта.
-
-На Windows или macOS набор системных зависимостей будет другим. WebGPU-код при этом останется практически тем же.
-
----
-
-# 12. Первый `main.cpp`
-
-Создадим `src/main.cpp`:
+Теперь создадим `src/main.cpp`:
 
 ```cpp
 #include <cstdlib>
@@ -564,269 +436,190 @@ int main() {
 }
 ```
 
-Это уже настоящий вызов Dawn C API.
+На первый взгляд программа почти ничего не делает. Но в ней уже есть две важные границы системы.
+
+Первая:
+
+```cpp
+glfwInit();
+```
+
+Мы инициализировали слой, который позже даст нам окно и input.
+
+Вторая:
+
+```cpp
+wgpuCreateInstance(...);
+```
+
+Мы впервые вошли в WebGPU/Dawn.
+
+При этом обратите внимание, чего здесь **ещё нет**:
+
+```text
+нет окна
+нет surface
+нет выбранного GPU
+нет device
+нет command queue
+нет render pipeline
+```
+
+Это важно, потому что `WGPUInstance` не означает «мы получили GPU». Он находится уровнем выше. В следующей главе мы увидим, зачем WebGPU вообще нужен этот промежуточный объект.
 
 ---
 
-# 13. Зачем нужен `GLFW_INCLUDE_NONE`
+## 10. Почему `GLFW_INCLUDE_NONE`
 
-Перед GLFW header находится строка:
+Перед GLFW мы написали:
 
 ```cpp
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 ```
 
-Она важна.
+GLFW исторически часто используется вместе с OpenGL и может автоматически подключать OpenGL headers.
 
-По умолчанию GLFW может попытаться автоматически включить OpenGL headers.
+Но в нашем приложении OpenGL API напрямую не используется. Даже если Dawn позднее выберет OpenGL как внутренний backend, это будет деталь реализации Dawn, а не API нашего приложения.
 
-Но наше приложение не использует OpenGL API напрямую. Нам нужен только GLFW как window/input library.
+Поэтому мы явно говорим GLFW:
 
-Поэтому мы явно говорим:
+> не подключай графический API за нас; нам от тебя нужны окно и input.
 
-```cpp
-#define GLFW_INCLUDE_NONE
+Это хорошо подчёркивает разделение ролей:
+
+```text
+GLFW    != renderer
+WebGPU  != window library
 ```
-
-То есть:
-
-> не подключай OpenGL headers за нас.
-
-Это избавляет проект от ненужной зависимости от `GL/gl.h` и уменьшает количество неявной магии в include chain.
-
-Позже, когда мы создадим окно, мы также скажем GLFW не создавать OpenGL context:
-
-```cpp
-glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-```
-
-Но это будет уже в главе про окно и Surface.
 
 ---
 
-# 14. Инициализация GLFW
+## 11. Что такое descriptor и почему WebGPU использует их повсюду
 
-```cpp
-if (glfwInit() != GLFW_TRUE) {
-    std::cerr << "Failed to initialize GLFW\n";
-    return EXIT_FAILURE;
-}
-```
-
-`glfwInit()` инициализирует GLFW и его platform backend.
-
-Пока мы даже не создаём окно.
-
-После успешной инициализации можно посмотреть runtime-информацию:
-
-```cpp
-std::cout << "GLFW: " << glfwGetVersionString() << '\n';
-```
-
-На тестовой системе вывод выглядит так:
-
-```text
-GLFW: 3.6.0 Wayland X11 GLX Null EGL OSMesa monotonic
-```
-
-Нас особенно интересуют слова:
-
-```text
-Wayland X11
-```
-
-Они показывают, что текущая сборка GLFW содержит оба Linux platform backend'а.
-
----
-
-# 15. Первый WebGPU descriptor
-
-Теперь первая строка непосредственно из WebGPU:
+Первая WebGPU-структура в нашем коде:
 
 ```cpp
 WGPUInstanceDescriptor descriptor{};
 ```
 
-Тип начинается с префикса:
+WebGPU часто создаёт объекты не длинным списком аргументов, а через descriptor structure.
+
+Вместо условного API:
+
+```cpp
+createSomething(width, height, format, usage, label, ...);
+```
+
+получается модель:
+
+```cpp
+WGPUSomethingDescriptor descriptor{};
+
+descriptor.width = ...;
+descriptor.height = ...;
+descriptor.format = ...;
+
+WGPUSomething object = wgpuCreateSomething(&descriptor);
+```
+
+По мере курса мы увидим:
 
 ```text
-WGPU
-```
-
-Это характерно для WebGPU C API.
-
-`WGPUInstanceDescriptor` — обычная структура параметров.
-
-Мы инициализируем её через:
-
-```cpp
-{}
-```
-
-поэтому поля получают нулевые/default значения.
-
-В следующих главах мы будем встречать огромное количество подобных descriptor'ов:
-
-```cpp
 WGPUDeviceDescriptor
 WGPUBufferDescriptor
 WGPUTextureDescriptor
 WGPURenderPipelineDescriptor
 ```
 
-Это одна из центральных моделей WebGPU API:
+Такой подход делает API расширяемым: в descriptor можно добавлять настройки, не превращая каждую функцию создания в десятки параметров.
 
-```text
-создать descriptor
-       ↓
-заполнить параметры
-       ↓
-передать descriptor в create-функцию
-```
+В этой главе descriptor пустой, потому что нам пока не нужны дополнительные instance features. В следующей главе это изменится.
 
 ---
 
-# 16. Создаём `WGPUInstance`
+## 12. Что такое `WGPUInstance` на интуитивном уровне
 
-```cpp
-WGPUInstance instance = wgpuCreateInstance(&descriptor);
-```
+Пока достаточно такой модели:
 
-Здесь уже участвуют три характерных элемента C API.
-
-Тип handle:
-
-```cpp
+```text
 WGPUInstance
+    = точка входа в конкретную реализацию WebGPU
 ```
 
-Функция:
+Это **не GPU** и **не device**.
 
-```cpp
-wgpuCreateInstance(...)
-```
-
-Descriptor:
-
-```cpp
-WGPUInstanceDescriptor
-```
-
-Паттерн повторится почти во всём WebGPU.
-
-Мы пока не будем подробно обсуждать роль `Instance`.
-
-В этой главе достаточно знать:
-
-> это корневой объект, через который начинается работа с WebGPU/Dawn.
-
-Подробнее — в главе 02.
-
----
-
-# 17. Проверяем результат
-
-C API возвращает opaque handle.
-
-Проверяем его:
-
-```cpp
-if (instance == nullptr) {
-    std::cerr << "Failed to create WebGPU instance\n";
-    glfwTerminate();
-    return EXIT_FAILURE;
-}
-```
-
-Если всё прошло успешно:
-
-```cpp
-std::cout << "Dawn/WebGPU: instance created successfully\n";
-```
-
-Таким образом мы проверили уже не только compiler include path.
-
-Если программа дошла сюда, значит:
+Представьте компьютер с двумя видеоустройствами:
 
 ```text
-webgpu.h
-   ↓
-main.cpp compiled
-   ↓
-wgpuCreateInstance symbol resolved
-   ↓
-libwebgpu_dawn.a linked
-   ↓
-Dawn code executed
+Integrated AMD GPU
+Discrete NVIDIA GPU
 ```
 
-Это и есть хороший первый smoke-test.
+На момент создания `WGPUInstance` мы ещё не сказали WebGPU, какое из них хотим использовать. Более того, реализация может иметь и software adapter.
+
+То есть путь будет примерно таким:
+
+```text
+создать WebGPU instance
+        │
+        ▼
+попросить подходящий adapter
+        │
+        ▼
+создать logical device
+        │
+        ▼
+создавать GPU resources
+```
+
+В следующей главе начнём именно со второго шага и разберём, почему запрос adapter в современном WebGPU асинхронный.
 
 ---
 
-# 18. Lifetime в C API
+## 13. Lifetime: почему есть `Release`
 
-В C API объект нужно освободить явно:
+После использования instance вызываем:
 
 ```cpp
 wgpuInstanceRelease(instance);
 ```
 
-После этого завершаем GLFW:
+C API не использует C++ destructor для `WGPUInstance`, потому что сам тип является C handle.
+
+Это даёт нам возможность явно видеть lifetime объекта:
+
+```text
+wgpuCreateInstance()
+        │
+        │ instance жив
+        ▼
+   используем его
+        │
+        ▼
+wgpuInstanceRelease()
+```
+
+Позже C++ wrapper сделает эту часть удобнее, но пока явный `Release` помогает не терять понимание ownership.
+
+И GLFW тоже имеет симметричную пару:
 
 ```cpp
+glfwInit();
+...
 glfwTerminate();
 ```
 
-Порядок сейчас простой:
-
-```text
-initialize GLFW
-    ↓
-create WGPUInstance
-    ↓
-use instance
-    ↓
-release WGPUInstance
-    ↓
-terminate GLFW
-```
-
-Позже lifetime станет намного важнее, потому что появятся:
-
-```text
-Instance
-Surface
-Adapter
-Device
-Queue
-Buffer
-Texture
-TextureView
-Pipeline
-...
-```
-
-В C API мы будем явно следить за ownership и release-функциями.
-
 ---
 
-# 19. Сборка Debug
+## 14. Собираем и запускаем
 
-Из корня проекта:
+Debug-сборка:
 
 ```bash
-cmake \
-    -S . \
-    -B build/debug \
-    -G Ninja \
+cmake -S . -B build/debug -G Ninja \
     -DCMAKE_BUILD_TYPE=Debug
-```
 
-Затем:
-
-```bash
 cmake --build build/debug
 ```
 
@@ -836,329 +629,95 @@ cmake --build build/debug
 ./build/debug/webgpu_tutorial
 ```
 
-Ожидаемый вывод примерно такой:
+В тестовой среде вывод выглядит примерно так:
 
 ```text
 GLFW: 3.6.0 Wayland X11 GLX Null EGL OSMesa monotonic
 Dawn/WebGPU: instance created successfully
 ```
 
-Точная строка GLFW может немного отличаться в зависимости от того, с какими backend'ами собрана библиотека.
+Первая строка подтверждает, что GLFW реально инициализировался.
 
----
-
-# 20. Сборка Release
-
-Создадим отдельный build directory:
-
-```bash
-cmake \
-    -S . \
-    -B build/release \
-    -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release
-```
-
-Сборка:
-
-```bash
-cmake --build build/release
-```
-
-Запуск:
-
-```bash
-./build/release/webgpu_tutorial
-```
-
-Раздельные каталоги удобнее, чем постоянно менять `CMAKE_BUILD_TYPE` в одном build tree:
-
-```text
-build/
-├── debug/
-└── release/
-```
-
----
-
-# 21. Что именно было проверено для этой главы
-
-Код выше был собран без изменений в Debug и Release.
-
-Для Debug linker command содержал:
-
-```text
-libglfw3.a
-libwebgpu_dawn.a
--ldl
--lm
--lrt
-```
-
-Программа была запущена через X11 в виртуальном display и получила:
-
-```text
-GLFW: 3.6.0 Wayland X11 GLX Null EGL OSMesa monotonic
-Dawn/WebGPU: instance created successfully
-```
-
-То есть контрольная точка главы проверена не только компиляцией, но и runtime-запуском.
-
----
-
-# 22. Почему мы пока не создаём окно
-
-Можно было бы уже сейчас написать:
-
-```cpp
-GLFWwindow* window = glfwCreateWindow(...);
-```
-
-Но мы специально этого не делаем.
-
-Причина — разделение ответственности между главами.
-
-Сейчас мы проверяем только инфраструктуру проекта:
-
-```text
-compiler
-C++20
-CMake
-GLFW
-Dawn
-static linking
-```
-
-Создание окна важно уже в контексте WebGPU Surface:
-
-```text
-GLFWwindow
-    ↓
-WGPUSurface
-```
-
-Поэтому окно появится в отдельной главе, где мы одновременно разберём:
-
-- `GLFW_NO_API`;
-- framebuffer size;
-- `webgpu_glfw.h`;
-- `wgpuGlfwCreateSurfaceForWindow()`;
-- X11 / Wayland;
-- resize;
-- surface configuration.
-
-Так каждая новая строка кода будет появляться тогда, когда мы понимаем, зачем она нужна.
-
----
-
-# 23. Как это выглядело бы через C++ wrapper
-
-Основная версия использует:
+Вторая важнее, чем может показаться. Если бы мы только подключили:
 
 ```cpp
 #include <webgpu/webgpu.h>
 ```
 
-и:
+это проверило бы лишь headers. Но вызов:
+
+```cpp
+wgpuCreateInstance(...)
+```
+
+заставляет linker найти реальную реализацию функции в Dawn. Поэтому это уже настоящий smoke-test всей связки include + static library + runtime.
+
+---
+
+## 15. А как выглядел бы этот кусок через C++ wrapper?
+
+C API:
 
 ```cpp
 WGPUInstanceDescriptor descriptor{};
 WGPUInstance instance = wgpuCreateInstance(&descriptor);
 
-if (instance == nullptr) {
-    // error
-}
+// ...
 
 wgpuInstanceRelease(instance);
 ```
 
-Через C++ wrapper код выглядел бы так:
+C++ wrapper:
 
 ```cpp
 #include <webgpu/webgpu_cpp.h>
 
 wgpu::InstanceDescriptor descriptor{};
 wgpu::Instance instance = wgpu::CreateInstance(&descriptor);
-
-if (!instance) {
-    // error
-}
 ```
 
-Обратите внимание: явного
+Главное отличие, которое уже заметно: `wgpu::Instance` является C++ object wrapper и управляет ссылкой удобнее.
 
-```cpp
-wgpuInstanceRelease(instance);
-```
+Но концептуальная модель не меняется. Это всё тот же WebGPU instance. Поэтому сначала мы разберём модель на более прозрачном C API, а wrapper будем воспринимать как другую форму записи тех же операций.
 
-здесь уже нет.
+---
 
-`wgpu::Instance` — C++ объект-обёртка, который управляет reference counting автоматически.
+## 16. Что мы теперь понимаем
 
-При этом отдельная C++ библиотека нам не нужна.
-
-И C API:
-
-```cpp
-#include <webgpu/webgpu.h>
-```
-
-и wrapper:
-
-```cpp
-#include <webgpu/webgpu_cpp.h>
-```
-
-в нашем случае работают поверх той же:
+После первой главы архитектура приложения должна выглядеть в голове примерно так:
 
 ```text
-libwebgpu_dawn.a
+                         CPU application
+                       /                 \
+                      /                   \
+                     ▼                     ▼
+                  GLFW                 WebGPU API
+             window + input                │
+                                           ▼
+                                          Dawn
+                                           │
+                                   native graphics API
+                                           │
+                                           ▼
+                                          GPU
 ```
 
-Именно поэтому в следующих главах можно будет легко показывать два варианта рядом.
+Но до GPU мы пока фактически ещё не дошли.
 
----
-
-# 24. Типичная ошибка: подключить GLFW после OpenGL
-
-Для этого курса лучше сразу придерживаться стабильного порядка includes:
-
-```cpp
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-
-#include <webgpu/webgpu.h>
-```
-
-Не нужно добавлять:
-
-```cpp
-#include <GL/gl.h>
-```
-
-или создавать OpenGL context.
-
-Наша графическая API-модель — WebGPU.
-
-GLFW используется только как platform/window/input layer.
-
----
-
-# 25. Типичная ошибка: считать успешную компиляцию успешной линковкой
-
-Такой код:
-
-```cpp
-#include <webgpu/webgpu.h>
-
-int main() {
-    return 0;
-}
-```
-
-может успешно скомпилироваться даже при неправильном подключении Dawn library.
-
-Почему?
-
-Потому что compiler увидел только объявления из header'а. Ему не понадобилось искать реализацию ни одной WebGPU-функции.
-
-Поэтому наш smoke-test действительно вызывает:
-
-```cpp
-wgpuCreateInstance(...)
-```
-
-И только после успешной линковки и запуска мы считаем dependency setup рабочим.
-
----
-
-# 26. Типичная ошибка: всегда брать Dawn `main`
-
-Для экспериментов нормально регулярно обновлять Dawn.
-
-Для туториала — нет.
-
-Если учебный код сегодня написан для одного commit, а читатель завтра получает другой, могут измениться:
-
-- структуры;
-- enum values;
-- callback signatures;
-- CMake targets;
-- extension descriptors;
-- lifetime rules;
-- helper APIs.
-
-Поэтому обновление Dawn в этом проекте должно быть отдельным осознанным действием:
+Мы только создали:
 
 ```text
-1. выбрать новый commit
-2. пересобрать Dawn
-3. прогнать все главы
-4. исправить несовместимости
-5. обновить Tested with
+WGPUInstance
 ```
 
-А не результатом случайного нового `git clone main`.
+то есть получили точку входа в WebGPU implementation.
 
----
+Следующий естественный вопрос:
 
-# 27. Контрольная точка главы
+> Хорошо, WebGPU доступен. Но какой GPU будет выполнять наши команды?
 
-После этой главы структура проекта должна выглядеть примерно так:
+И здесь появляется следующая сущность — **adapter**.
 
-```text
-webgpu-tutorial/
-├── .modules/
-│   ├── dawn/
-│   │   ├── DAWN_COMMIT
-│   │   ├── include/
-│   │   └── lib/
-│   │
-│   └── glfw3/
-│       ├── include/
-│       └── lib/
-│
-├── build/
-│   ├── debug/
-│   └── release/
-│
-├── src/
-│   └── main.cpp
-│
-└── CMakeLists.txt
-```
+Однако `RequestAdapter` приводит нас к ещё одной важной особенности современного WebGPU: многие операции API асинхронны и возвращают `WGPUFuture`.
 
-А программа должна вывести две диагностические строки:
-
-```text
-GLFW: ...
-Dawn/WebGPU: instance created successfully
-```
-
-Если это работает, у нас есть базовый проект, поверх которого уже можно изучать сам WebGPU API.
-
----
-
-# 28. Что дальше
-
-В следующей главе разберём то, что здесь намеренно использовали почти как чёрный ящик:
-
-```cpp
-WGPUInstanceDescriptor descriptor{};
-WGPUInstance instance = wgpuCreateInstance(&descriptor);
-```
-
-Нас будут интересовать:
-
-- что такое `WGPUInstance`;
-- какие возможности Instance может требовать;
-- `WGPUFuture`;
-- `WGPUFutureWaitInfo`;
-- `wgpuInstanceWaitAny()`;
-- `wgpuInstanceProcessEvents()`;
-- `WGPUCallbackMode`;
-- почему современный Dawn-код заметно отличается от callback-кода в старых WebGPU tutorials;
-- как устроен `WGPUStringView`;
-- как безопасно передавать userdata в callback.
-
-После этого мы будем готовы асинхронно запросить первый `WGPUAdapter`.
+Этим и займёмся в следующей главе.
