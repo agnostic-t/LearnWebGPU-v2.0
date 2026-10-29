@@ -1,4 +1,10 @@
-![[WebGPU Logo]](https://raw.githubusercontent.com/eliemichel/LearnWebGPU/main/images/webgpu-dark.svg)
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/eliemichel/LearnWebGPU/main/images/webgpu-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/eliemichel/LearnWebGPU/main/images/webgpu-light.svg">
+    <img alt="Learn WebGPU Logo" src="images/webgpu-dark.svg" width="200">
+  </picture>
+</div>
 
 # LearnWebGPU v2.0
 
